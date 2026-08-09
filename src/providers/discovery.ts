@@ -440,7 +440,8 @@ export class GroqProvider implements Provider {
   name = 'groq';
   private apiKey: string;
   private baseUrl = 'https://api.groq.com/openai/v1';
-  private defaultModel = 'llama-3.1-70b-versatile';
+  // llama-3.1-70b-versatile was decommissioned (returns 404). Use current production model.
+  private defaultModel = process.env.CLODDS_GROQ_MODEL || 'llama-3.3-70b-versatile';
 
   constructor(apiKey: string) {
     this.apiKey = apiKey;
@@ -466,7 +467,18 @@ export class GroqProvider implements Provider {
     });
 
     if (!response.ok) {
-      throw new Error(`Groq error: ${response.status}`);
+      let detail = '';
+      try {
+        detail = (await response.text()).slice(0, 300);
+      } catch {
+        // ignore
+      }
+      throw new Error(
+        `Groq error: ${response.status}${detail ? ` — ${detail}` : ''}` +
+          (response.status === 404
+            ? ' (model may be decommissioned; set CLODDS_GROQ_MODEL or use llama-3.3-70b-versatile)'
+            : '')
+      );
     }
 
     const data = await response.json() as {
@@ -505,7 +517,18 @@ export class GroqProvider implements Provider {
     });
 
     if (!response.ok) {
-      throw new Error(`Groq error: ${response.status}`);
+      let detail = '';
+      try {
+        detail = (await response.text()).slice(0, 300);
+      } catch {
+        // ignore
+      }
+      throw new Error(
+        `Groq error: ${response.status}${detail ? ` — ${detail}` : ''}` +
+          (response.status === 404
+            ? ' (model may be decommissioned; set CLODDS_GROQ_MODEL or use llama-3.3-70b-versatile)'
+            : '')
+      );
     }
 
     const reader = response.body?.getReader();
@@ -515,8 +538,7 @@ export class GroqProvider implements Provider {
     let buffer = '';
 
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      const { done, value } = await reader.read();      if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -546,7 +568,25 @@ export class GroqProvider implements Provider {
   }
 
   async listModels(): Promise<string[]> {
-    return ['llama-3.1-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768'];
+    // Prefer live list from API; fall back to known production IDs.
+    try {
+      const response = await fetch(`${this.baseUrl}/models`, {
+        headers: { 'Authorization': `Bearer ${this.apiKey}` },
+      });
+      if (response.ok) {
+        const data = (await response.json()) as { data?: Array<{ id: string }> };
+        const ids = (data.data || []).map((m) => m.id).filter(Boolean);
+        if (ids.length) return ids;
+      }
+    } catch {
+      // ignore and use static list
+    }
+    return [
+      'llama-3.3-70b-versatile',
+      'llama-3.1-8b-instant',
+      'openai/gpt-oss-120b',
+      'openai/gpt-oss-20b',
+    ];
   }
 
   async isAvailable(): Promise<boolean> {

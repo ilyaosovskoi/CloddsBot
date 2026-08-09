@@ -17,7 +17,7 @@ import { existsSync, writeFileSync, readFileSync, mkdirSync, readdirSync, unlink
 import { join } from 'path';
 import { homedir } from 'os';
 import { logger } from '../utils/logger';
-import Anthropic from '@anthropic-ai/sdk';
+import { providers, ProviderManager } from '../providers';
 
 // =============================================================================
 // TYPES
@@ -464,8 +464,8 @@ export interface SubagentManager {
   getRegistry(): RunRegistry;
   /** Set result announcer callback */
   setAnnouncer(fn: (state: SubagentState) => Promise<void>): void;
-  /** Set Anthropic client */
-  setClient(client: Anthropic): void;
+  /** Set LLM client (ProviderManager for multi-provider support) */
+  setClient(client: ProviderManager): void;
 }
 
 /**
@@ -474,7 +474,7 @@ export interface SubagentManager {
 export function createSubagentManager(): SubagentManager {
   const registry = createRunRegistry();
   let announcer: ((state: SubagentState) => Promise<void>) | null = null;
-  let anthropicClient: Anthropic | null = null;
+  let llmClient: ProviderManager | null = null;
 
   /**
    * Create initial state for a new run
@@ -537,20 +537,22 @@ export function createSubagentManager(): SubagentManager {
     const signal = controller?.signal;
 
     // Ensure we have a client
-    if (!anthropicClient) {
-      const apiKey = process.env.ANTHROPIC_API_KEY;
-      if (!apiKey) {
+    if (!llmClient) {
+      // Try to get from provider manager
+      try {
+        const provider = providers.get();
+        llmClient = providers; // Use the provider manager
+      } catch (providerError) {
         state.status = 'failed';
         state.error = {
-          message: 'ANTHROPIC_API_KEY not set',
+          message: 'No AI provider available for subagents',
           category: 'auth',
           retryable: false,
         };
         saveSubagentState(state);
-        run.events.emit('error', new Error('ANTHROPIC_API_KEY not set'));
+        run.events.emit('error', new Error('No AI provider available for subagents'));
         return state;
       }
-      anthropicClient = new Anthropic({ apiKey });
     }
 
     const model = state.config.model || 'claude-3-5-sonnet-20241022';
@@ -578,7 +580,7 @@ export function createSubagentManager(): SubagentManager {
 
     try {
       // Build messages from state (for resumption)
-      const messages: Anthropic.MessageParam[] = state.messages.map(m => ({
+      const messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }> = state.messages.map(m => ({
         role: m.role === 'system' ? 'user' : m.role as 'user' | 'assistant',
         content: m.content,
       }));
@@ -608,88 +610,44 @@ export function createSubagentManager(): SubagentManager {
         run.events.emit('turn', state.turn);
         logger.debug({ id: state.config.id, turn: state.turn }, 'Subagent turn');
 
-        // Make API call
-        const response = await anthropicClient.messages.create(
-          {
-            model,
-            max_tokens: 4096,
-            system: systemPrompt,
-            messages,
-          },
-          signal ? { signal } : undefined
+        // Make API call using provider manager
+        const completion = await llmClient.complete(
+          messages.map(m => ({ role: m.role, content: m.content })),
+          { model, maxTokens: 4096 }
         );
+        const response = {
+          content: [{ type: 'text', text: completion.content }],
+          usage: { input_tokens: completion.usage.inputTokens, output_tokens: completion.usage.outputTokens },
+          stop_reason: completion.finishReason === 'max_tokens' ? 'max_tokens' : 'end_turn',
+        };
 
         // Track tokens/cost
         state.cost.inputTokens += response.usage.input_tokens;
         state.cost.outputTokens += response.usage.output_tokens;
         state.cost.totalCost = calculateCost(model, state.cost.inputTokens, state.cost.outputTokens);
 
-        // Check for tool use
-        const hasToolUse = response.content.some(block => block.type === 'tool_use');
+        // Check for tool use (provider doesn't support tools directly, so we skip tool use for now)
+        const hasToolUse = false;
 
-        if (hasToolUse) {
-          // Process tool calls
-          const assistantContent = response.content;
-          messages.push({ role: 'assistant', content: assistantContent });
+        // No tool use support yet — provider manager doesn't expose tools
+        // Extract final response
+        const textBlocks = response.content.filter(b => b.type === 'text');
+        const responseText = textBlocks
+          .map(b => b.text)
+          .join('\n');
 
-          const toolResults: Anthropic.ToolResultBlockParam[] = [];
+        state.messages.push({
+          role: 'assistant',
+          content: responseText,
+          timestamp: new Date(),
+          tokens: response.usage.output_tokens,
+        });
 
-          for (const block of assistantContent) {
-            if (block.type === 'tool_use') {
-              const startTime = Date.now();
-              const toolCall = {
-                tool: block.name,
-                params: block.input as Record<string, unknown>,
-                timestamp: new Date(),
-                durationMs: 0,
-                result: undefined as unknown,
-                error: undefined as string | undefined,
-              };
-
-              try {
-                const result = await toolExecutor(block.name, block.input as Record<string, unknown>, state);
-                toolCall.result = result;
-                toolResults.push({
-                  type: 'tool_result',
-                  tool_use_id: block.id,
-                  content: result,
-                });
-              } catch (error) {
-                const errMsg = error instanceof Error ? error.message : String(error);
-                toolCall.error = errMsg;
-                toolResults.push({
-                  type: 'tool_result',
-                  tool_use_id: block.id,
-                  content: JSON.stringify({ error: errMsg }),
-                });
-              }
-
-              toolCall.durationMs = Date.now() - startTime;
-              state.toolCalls.push(toolCall);
-            }
-          }
-
-          messages.push({ role: 'user', content: toolResults });
-        } else {
-          // Extract final response
-          const textBlocks = response.content.filter(b => b.type === 'text');
-          const responseText = textBlocks
-            .map(b => (b as Anthropic.TextBlock).text)
-            .join('\n');
-
-          state.messages.push({
-            role: 'assistant',
-            content: responseText,
-            timestamp: new Date(),
-            tokens: response.usage.output_tokens,
-          });
-
-          // Done!
-          state.result = responseText;
-          state.status = 'completed';
-          state.completedAt = new Date();
-          break;
-        }
+        // Done!
+        state.result = responseText;
+        state.status = 'completed';
+        state.completedAt = new Date();
+        break;
 
         // Periodically save state
         if (state.turn % 3 === 0) {
@@ -953,7 +911,7 @@ export function createSubagentManager(): SubagentManager {
     },
 
     setClient(client) {
-      anthropicClient = client;
+      llmClient = client;
     },
   };
 }

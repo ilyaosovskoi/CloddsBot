@@ -86,7 +86,8 @@ export class GeminiProvider implements Provider {
   name = 'gemini';
   private apiKey: string;
   private baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
-  private defaultModel = process.env.CLODDS_GEMINI_MODEL || 'gemini-1.5-pro';
+  // Prefer a currently supported Gemini model. Override via CLODDS_GEMINI_MODEL.
+  private defaultModel = process.env.CLODDS_GEMINI_MODEL || 'gemini-2.5-flash';
 
   constructor(apiKey: string) {
     this.apiKey = apiKey;
@@ -94,8 +95,21 @@ export class GeminiProvider implements Provider {
 
   private endpoint(model: string, method: 'generateContent' | 'streamGenerateContent'): string {
     const sanitized = model.replace(/[^a-zA-Z0-9._\-/]/g, '');
-    const cleanModel = sanitized.startsWith('models/') ? sanitized : `models/${sanitized}`;
-    return `${this.baseUrl}/${cleanModel}:${method}?key=${this.apiKey}`;
+    // Strip accidental provider prefixes like "gemini/gemini-2.5-flash"
+    const withoutPrefix = sanitized.replace(/^gemini\//, '');
+    const cleanModel = withoutPrefix.startsWith('models/') ? withoutPrefix : `models/${withoutPrefix}`;
+    // Streaming requires alt=sse for Server-Sent Events from the Gemini API
+    const alt = method === 'streamGenerateContent' ? '&alt=sse' : '';
+    return `${this.baseUrl}/${cleanModel}:${method}?key=${this.apiKey}${alt}`;
+  }
+
+  /** Resolve a Gemini model id; never pass foreign ids (claude-*, gpt-*, …). */
+  private resolveModel(requested?: string): string {
+    const m = (requested || '').trim();
+    if (m && (m.toLowerCase().startsWith('gemini') || m.toLowerCase().startsWith('models/gemini'))) {
+      return m.replace(/^models\//, '');
+    }
+    return this.defaultModel;
   }
 
   private toGeminiMessages(messages: Message[]): Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> {
@@ -122,7 +136,7 @@ export class GeminiProvider implements Provider {
 
   async complete(messages: Message[], options: CompletionOptions = {}): Promise<CompletionResult> {
     const startTime = Date.now();
-    const model = options.model || this.defaultModel;
+    const model = this.resolveModel(options.model);
 
     const response = await fetch(this.endpoint(model, 'generateContent'), {
       method: 'POST',
@@ -139,7 +153,9 @@ export class GeminiProvider implements Provider {
     });
 
     if (!response.ok) {
-      throw new Error(`Gemini error: ${response.status}`);
+      let detail = '';
+      try { detail = (await response.text()).slice(0, 400); } catch { /* ignore */ }
+      throw new Error(`Gemini error: ${response.status} (model=${model})${detail ? ` — ${detail}` : ''}`);
     }
 
     const data = await response.json() as {
@@ -165,7 +181,7 @@ export class GeminiProvider implements Provider {
   }
 
   async *stream(messages: Message[], options: CompletionOptions = {}): AsyncIterable<StreamChunk> {
-    const model = options.model || this.defaultModel;
+    const model = this.resolveModel(options.model);
 
     const response = await fetch(this.endpoint(model, 'streamGenerateContent'), {
       method: 'POST',
@@ -182,7 +198,9 @@ export class GeminiProvider implements Provider {
     });
 
     if (!response.ok) {
-      throw new Error(`Gemini streaming error: ${response.status}`);
+      let detail = '';
+      try { detail = (await response.text()).slice(0, 400); } catch { /* ignore */ }
+      throw new Error(`Gemini streaming error: ${response.status} (model=${model})${detail ? ` — ${detail}` : ''}`);
     }
 
     const reader = response.body?.getReader();
@@ -198,13 +216,17 @@ export class GeminiProvider implements Provider {
       try {
         buffer += decoder.decode(value, { stream: true });
 
-        // Gemini streaming responses are JSON lines.
+        // Gemini with alt=sse sends "data: {...}" lines; without alt it may be raw JSON lines.
         const lines = buffer.split('\n');
         buffer = lines.pop() ?? '';
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
+          let trimmed = line.trim();
+          if (!trimmed || trimmed === 'data: [DONE]') continue;
+          if (trimmed.startsWith('data:')) {
+            trimmed = trimmed.slice(5).trim();
+          }
+          if (!trimmed || trimmed === '[DONE]') continue;
 
           try {
             const event = JSON.parse(trimmed) as {
@@ -265,7 +287,7 @@ export class AnthropicProvider implements Provider {
   constructor(config: ProviderConfig) {
     this.config = {
       baseUrl: 'https://api.anthropic.com',
-      defaultModel: 'claude-3-5-sonnet-20241022',
+      defaultModel: 'claude-sonnet-4-20250514',
       timeout: 120000,
       maxRetries: 3,
       ...config,
@@ -403,6 +425,8 @@ export class AnthropicProvider implements Provider {
 
   async listModels(): Promise<string[]> {
     return [
+      'claude-sonnet-4-20250514',
+      'claude-opus-4-20250514',
       'claude-3-5-sonnet-20241022',
       'claude-3-opus-20240229',
       'claude-3-sonnet-20240229',
@@ -484,7 +508,7 @@ export class OpenAIProvider implements Provider {
   constructor(config: ProviderConfig) {
     this.config = {
       baseUrl: 'https://api.openai.com',
-      defaultModel: 'gpt-4o',
+      defaultModel: 'gpt-4o-2024-11-20',
       timeout: 120000,
       maxRetries: 3,
       ...config,
@@ -1044,10 +1068,13 @@ export interface CostConfig {
 }
 
 const MODEL_COSTS: Record<string, CostConfig> = {
+  'claude-sonnet-4-20250514': { inputCostPer1k: 0.003, outputCostPer1k: 0.015 },
+  'claude-opus-4-20250514': { inputCostPer1k: 0.015, outputCostPer1k: 0.075 },
   'claude-3-5-sonnet-20241022': { inputCostPer1k: 0.003, outputCostPer1k: 0.015 },
   'claude-3-opus-20240229': { inputCostPer1k: 0.015, outputCostPer1k: 0.075 },
   'claude-3-sonnet-20240229': { inputCostPer1k: 0.003, outputCostPer1k: 0.015 },
   'claude-3-haiku-20240307': { inputCostPer1k: 0.00025, outputCostPer1k: 0.00125 },
+  'gpt-4o-2024-11-20': { inputCostPer1k: 0.005, outputCostPer1k: 0.015 },
   'gpt-4o': { inputCostPer1k: 0.005, outputCostPer1k: 0.015 },
   'gpt-4-turbo': { inputCostPer1k: 0.01, outputCostPer1k: 0.03 },
   'gpt-3.5-turbo': { inputCostPer1k: 0.0005, outputCostPer1k: 0.0015 },
@@ -1144,6 +1171,25 @@ if (process.env.FIREWORKS_API_KEY) {
 if (process.env.GEMINI_API_KEY) {
   providers.register(new GeminiProvider(process.env.GEMINI_API_KEY));
 }
+
+// Prefer an explicit default, otherwise prefer stronger/chat-first providers.
+// Without this, the first registered key becomes default (e.g. GROQ before GEMINI)
+// and every message hits Groq even when the user selected Gemini.
+(() => {
+  const preferred = (process.env.CLODDS_DEFAULT_PROVIDER || process.env.CLODDS_PROVIDER || '').toLowerCase();
+  const list = providers.list();
+  if (preferred && list.includes(preferred)) {
+    providers.setDefault(preferred);
+    return;
+  }
+  const order = ['anthropic', 'openai', 'gemini', 'groq', 'together', 'fireworks', 'ollama'];
+  for (const name of order) {
+    if (list.includes(name)) {
+      providers.setDefault(name);
+      return;
+    }
+  }
+})();
 
 export { createProviderHealthMonitor } from './health';
 export type { ProviderHealthMonitor, ProviderHealthSnapshot, ProviderHealthStatus } from './health';

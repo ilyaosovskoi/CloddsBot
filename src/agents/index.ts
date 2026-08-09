@@ -3,7 +3,9 @@
  * Handles AI agent instances and message routing
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import { providers, ProviderManager, AnthropicProvider, OpenAIProvider, OllamaProvider, GeminiProvider } from '../providers';
+import { GroqProvider, TogetherProvider, FireworksProvider } from '../providers/discovery';
+import { CompletionResult, StreamChunk } from '../providers';
 import { spawn, spawnSync, ChildProcess, execSync, execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { generateId as generateSecureId } from '../utils/id';
@@ -342,7 +344,7 @@ const STREAM_RESPONSE_PLATFORMS = new Set([
   'teams',
   'webchat',
 ]);
-const MEMORY_EXTRACT_MODEL = process.env.CLODDS_MEMORY_EXTRACT_MODEL || process.env.CLODDS_SUMMARY_MODEL || 'claude-3-5-haiku-20241022';
+const MEMORY_EXTRACT_MODEL = process.env.CLODDS_MEMORY_EXTRACT_MODEL || process.env.CLODDS_SUMMARY_MODEL || 'claude-haiku-4-5-20251001';
 const KALSHI_API_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
 const DRIFT_GATEWAY_URL = process.env.DRIFT_GATEWAY_URL || 'http://localhost:8080';
 
@@ -446,36 +448,34 @@ function limitItems<T extends { key?: string; value?: string }>(items: T[] | und
 }
 
 async function extractMemoryWithClaude(
-  client: Anthropic,
+  client: ProviderManager,
   text: string,
   maxItems: number
 ): Promise<MemoryExtractionResult | null> {
-  const response = await client.messages.create({
+  const response = await client.complete([
+    {
+      role: 'system',
+      content:
+        'You extract durable user memory from conversations. '
+        + 'Return ONLY valid JSON with keys: profile_summary, summary, facts, preferences, notes, topics. '
+        + 'facts/preferences/notes are arrays of {key, value}. Keep items concise. '
+        + 'Do not include any prose, markdown, or code fences — only the JSON object.',
+    },
+    {
+      role: 'user',
+      content:
+        'Extract durable user memory from the following turn. '
+        + `Limit each list to ${maxItems} items. `
+        + 'If no items, use empty arrays. Use null for missing summaries.\n\n'
+        + text,
+    },
+  ], {
     model: MEMORY_EXTRACT_MODEL,
-    max_tokens: 700,
-    system:
-      'You extract durable user memory from conversations. '
-      + 'Return ONLY valid JSON with keys: profile_summary, summary, facts, preferences, notes, topics. '
-      + 'facts/preferences/notes are arrays of {key, value}. Keep items concise.',
-    messages: [
-      {
-        role: 'user',
-        content:
-          'Extract durable user memory from the following turn. '
-          + `Limit each list to ${maxItems} items. `
-          + 'If no items, use empty arrays. Use null for missing summaries.\n\n'
-          + text,
-      },
-    ],
+    maxTokens: 700,
+    temperature: 0,
   });
 
-  const raw = response.content
-    .filter((b) => b.type === 'text')
-    .map((b) => (b as Anthropic.TextBlock).text)
-    .join('\n')
-    .trim();
-
-  return safeParseJsonObject<MemoryExtractionResult>(raw);
+  return safeParseJsonObject<MemoryExtractionResult>(response.content);
 }
 
 async function fetchPolymarketClob(
@@ -17006,12 +17006,57 @@ export async function createAgentManager(
   webhookToolProvider?: () => WebhookTool | undefined,
   executionService?: ExecutionServiceRef | null
 ): Promise<AgentManager> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    throw new Error('ANTHROPIC_API_KEY environment variable is required');
+  const apiKey = process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY || process.env.GROQ_API_KEY || process.env.TOGETHER_API_KEY || process.env.FIREWORKS_API_KEY;
+  if (!apiKey && !process.env.OLLAMA_URL) {
+    throw new Error('No AI provider configured. Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, TOGETHER_API_KEY, FIREWORKS_API_KEY, or OLLAMA_URL');
   }
 
-  const client = new Anthropic({ apiKey });
+  // Initialize provider manager if not already done
+  if (providers.list().length === 0) {
+    // Auto-register from environment (same as in providers/index.ts)
+    if (process.env.ANTHROPIC_API_KEY) {
+      providers.register(new AnthropicProvider({ apiKey: process.env.ANTHROPIC_API_KEY }));
+    }
+    if (process.env.OPENAI_API_KEY) {
+      providers.register(new OpenAIProvider({ apiKey: process.env.OPENAI_API_KEY }));
+    }
+    if (process.env.OLLAMA_URL) {
+      providers.register(new OllamaProvider(process.env.OLLAMA_URL));
+    }
+    if (process.env.GROQ_API_KEY) {
+      providers.register(new GroqProvider(process.env.GROQ_API_KEY));
+    }
+    if (process.env.TOGETHER_API_KEY) {
+      providers.register(new TogetherProvider(process.env.TOGETHER_API_KEY));
+    }
+    if (process.env.FIREWORKS_API_KEY) {
+      providers.register(new FireworksProvider(process.env.FIREWORKS_API_KEY));
+    }
+    if (process.env.GEMINI_API_KEY) {
+      providers.register(new GeminiProvider(process.env.GEMINI_API_KEY));
+    }
+
+    if (providers.list().length === 0) {
+      throw new Error('No AI providers could be initialized. Check your API keys.');
+    }
+
+    // Align default with preferred order (same logic as providers/index.ts)
+    const preferred = (process.env.CLODDS_DEFAULT_PROVIDER || process.env.CLODDS_PROVIDER || '').toLowerCase();
+    const list = providers.list();
+    if (preferred && list.includes(preferred)) {
+      providers.setDefault(preferred);
+    } else {
+      for (const name of ['anthropic', 'openai', 'gemini', 'groq', 'together', 'fireworks', 'ollama']) {
+        if (list.includes(name)) {
+          providers.setDefault(name);
+          break;
+        }
+      }
+    }
+  }
+
+  // Get the provider manager (handles fallback chains, etc.)
+  const client = providers;
   const skills = createSkillManager(config.agents.defaults.workspace);
   let credentials: CredentialsManager;
   try {
@@ -17269,7 +17314,8 @@ export async function createAgentManager(
     try {
       // Build messages with conversation history for multi-turn context
       const history = sessionManager.getHistory(session);
-      const messages: Anthropic.MessageParam[] = [];
+      type MessageContent = string | Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
+      const messages: Array<{ role: 'user' | 'assistant' | 'system'; content: MessageContent }> = [];
 
       // Add previous conversation history
       for (const msg of history) {
@@ -17301,9 +17347,188 @@ export async function createAgentManager(
       let streamedResponseSent = false;
       let streamedMessageId: string | null = null;
 
-      const createMessageWithRetry = (params: Anthropic.MessageCreateParamsNonStreaming): Promise<Anthropic.Message> => {
-        return withRetry(
-          () => client.messages.create(params) as Promise<Anthropic.Message>,
+      /**
+       * Convert Anthropic-style request params (system blocks + structured
+       * message content) into the flat {role, content: string}[] shape that
+       * the Provider abstraction expects.
+       *
+       * - `params.system` may be a string, or an array of Anthropic system
+       *   blocks ({type: 'text', text, cache_control?}). We extract the text
+       *   from each block and join with newlines, then emit a single
+       *   system-role message at the start of the conversation.
+       * - `params.messages` content may be a string or an array of Anthropic
+       *   content blocks (text / tool_use / tool_result). The Provider
+       *   abstraction only accepts string content, so non-string content is
+       *   JSON-stringified. (Tool-use round-tripping is therefore lossy
+       *   until the Provider interface grows structured-content support;
+       *   see TODO in subagents.ts.)
+       *
+       * `params.tools` is intentionally not forwarded — the Provider
+       * abstraction does not yet expose a tools parameter. Tool selection
+       * still happens client-side via the tool_search skill, and tool
+       * execution is performed locally before the next turn is sent.
+       */
+      const buildProviderMessages = (params: {
+        system: any;
+        tools: any[];
+        messages: any[];
+      }): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> => {
+        const out: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [];
+
+        // Normalise system prompt to a single string.
+        let systemText = '';
+        if (typeof params.system === 'string') {
+          systemText = params.system;
+        } else if (Array.isArray(params.system)) {
+          systemText = params.system
+            .map((b: any) => (b && typeof b === 'object' && typeof b.text === 'string' ? b.text : ''))
+            .filter(Boolean)
+            .join('\n\n');
+        }
+        if (systemText) {
+          out.push({ role: 'system', content: systemText });
+        }
+
+        for (const m of params.messages ?? []) {
+          const role: 'user' | 'assistant' = m.role === 'assistant' ? 'assistant' : 'user';
+          let content: string;
+          if (typeof m.content === 'string') {
+            content = m.content;
+          } else if (Array.isArray(m.content)) {
+            // Concatenate text blocks; stringify tool_use / tool_result so
+            // the model still sees their content in a stable shape.
+            content = m.content
+              .map((b: any) => {
+                if (b && typeof b === 'object') {
+                  if (typeof b.text === 'string') return b.text;
+                  // Preserve tool_use / tool_result as JSON so the assistant
+                  // can reason about prior tool calls in the conversation.
+                  return JSON.stringify(b);
+                }
+                return String(b ?? '');
+              })
+              .join('\n');
+          } else if (m.content && typeof m.content === 'object') {
+            content = JSON.stringify(m.content);
+          } else {
+            content = String(m.content ?? '');
+          }
+          out.push({ role, content });
+        }
+        return out;
+      };
+
+      /**
+       * Resolve which ProviderManager backend to use for a given model id.
+       * Without this, stream/complete always hit the first-registered provider
+       * (often groq), even when the user selected Gemini — and a Claude model
+       * id sent to Groq returns HTTP 404.
+       */
+      const resolveProviderForModel = (model: string): string | undefined => {
+        const available = new Set(providers.list());
+        const m = (model || '').toLowerCase();
+
+        // Explicit provider/model prefixes: "gemini/...", "groq/...", etc.
+        const slash = m.indexOf('/');
+        if (slash > 0) {
+          const prefix = m.slice(0, slash);
+          if (available.has(prefix)) return prefix;
+        }
+
+        if ((m.startsWith('gemini') || m.startsWith('models/gemini')) && available.has('gemini')) {
+          return 'gemini';
+        }
+        if ((m.startsWith('claude') || m.startsWith('anthropic')) && available.has('anthropic')) {
+          return 'anthropic';
+        }
+        if ((m.startsWith('gpt') || m.startsWith('o1') || m.startsWith('o3') || m.startsWith('chatgpt')) && available.has('openai')) {
+          return 'openai';
+        }
+        if ((m.includes('llama') || m.includes('mixtral') || m.startsWith('openai/gpt-oss')) && available.has('groq')) {
+          return 'groq';
+        }
+
+        // Session / env preference
+        const preferred =
+          (session.context as any)?.providerOverride ||
+          process.env.CLODDS_DEFAULT_PROVIDER ||
+          process.env.CLODDS_PROVIDER;
+        if (preferred && available.has(String(preferred).toLowerCase())) {
+          return String(preferred).toLowerCase();
+        }
+
+        // Prefer Gemini when it's the only chat-capable key configured
+        if (available.has('gemini') && !available.has('anthropic') && !available.has('openai')) {
+          return 'gemini';
+        }
+        if (available.has('anthropic')) return 'anthropic';
+        if (available.has('openai')) return 'openai';
+        if (available.has('gemini')) return 'gemini';
+        if (available.has('groq')) return 'groq';
+        return undefined;
+      };
+
+      /** Drop model ids that the target provider cannot serve (avoids 404). */
+      const sanitizeModelForProvider = (model: string, providerName?: string): string | undefined => {
+        if (!providerName) return model;
+        const m = (model || '').toLowerCase();
+        if (providerName === 'gemini') {
+          if (m.startsWith('gemini') || m.startsWith('models/gemini')) return model;
+          return undefined; // let GeminiProvider use its defaultModel
+        }
+        if (providerName === 'groq') {
+          if (m.includes('llama') || m.includes('mixtral') || m.includes('gemma') || m.includes('gpt-oss') || m.includes('qwen')) {
+            return model;
+          }
+          return undefined;
+        }
+        if (providerName === 'anthropic') {
+          if (m.startsWith('claude')) return model;
+          return undefined;
+        }
+        if (providerName === 'openai') {
+          if (m.startsWith('gpt') || m.startsWith('o1') || m.startsWith('o3') || m.startsWith('chatgpt')) return model;
+          return undefined;
+        }
+        return model;
+      };
+
+      const createMessageWithRetry = async (params: {
+        model: string;
+        max_tokens: number;
+        system: any;
+        tools: any[];
+        messages: any[];
+      }): Promise<{
+        content: Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
+        stop_reason: string;
+        usage: { input_tokens: number; output_tokens: number };
+      }> => {
+        const providerName = resolveProviderForModel(params.model);
+        const modelForProvider =
+          sanitizeModelForProvider(params.model, providerName) ||
+          (providerName === 'gemini'
+            ? (process.env.CLODDS_GEMINI_MODEL || 'gemini-2.5-flash')
+            : providerName === 'groq'
+              ? (process.env.CLODDS_GROQ_MODEL || 'llama-3.3-70b-versatile')
+              : undefined);
+        const result = await withRetry(
+          async () => {
+            const completion = await client.complete(
+              buildProviderMessages(params),
+              {
+                model: modelForProvider,
+                maxTokens: params.max_tokens,
+                temperature: 0.7,
+                provider: providerName,
+              }
+            );
+            return {
+              content: [{ type: 'text', text: completion.content }],
+              stop_reason: 'end_turn',
+              usage: { input_tokens: completion.usage.inputTokens, output_tokens: completion.usage.outputTokens },
+            };
+          },
           {
             ...RETRY_POLICIES.default.config,
             onRetry: (info) => {
@@ -17313,10 +17538,12 @@ export async function createAgentManager(
                 maxAttempts: info.maxAttempts,
                 delay: info.delay,
                 error: info.error.message,
+                provider: providerName,
               }, 'Retrying LLM request');
             },
           }
         );
+        return result;
       };
 
       const canStreamResponse =
@@ -17324,129 +17551,87 @@ export async function createAgentManager(
         Boolean(editMessage) &&
         STREAM_RESPONSE_PLATFORMS.has(processedMessage.platform);
 
-      const extractResponseText = (response: Anthropic.Message): string => {
-        const textBlocks = response.content.filter((b): b is Anthropic.TextBlock => b.type === 'text');
+      const extractResponseText = (response: {
+        content: Array<{ type: string; text?: string }>;
+      }): string => {
+        const textBlocks = response.content.filter((b) => b.type === 'text' && b.text) as Array<{ type: 'text'; text: string }>;
         return textBlocks.map((b) => b.text).join('\n');
       };
 
       const createMessageStreamed = async (
-        params: Anthropic.MessageCreateParamsNonStreaming
-      ): Promise<Anthropic.Message> => {
-        let streamHasOutput = false;
-        let pendingText = '';
-        let lastSentText = '';
-        let lastUpdateAt = 0;
-        let updateTimer: NodeJS.Timeout | null = null;
-
-        const scheduleFlush = (): void => {
-          if (updateTimer) return;
-          const delay = Math.max(0, STREAM_RESPONSE_INTERVAL_MS - (Date.now() - lastUpdateAt));
-          updateTimer = setTimeout(() => {
-            updateTimer = null;
-            void flushUpdate(true);
-          }, delay);
-        };
-
-        const flushUpdate = async (force = false): Promise<void> => {
-          if (!pendingText || pendingText === lastSentText) return;
-          const now = Date.now();
-          if (!force && now - lastUpdateAt < STREAM_RESPONSE_INTERVAL_MS) {
-            scheduleFlush();
-            return;
-          }
-          try {
-            if (!streamedMessageId) {
-              const sentId = await sendMessage({
-                platform: processedMessage.platform,
-                chatId: processedMessage.chatId,
-                text: pendingText,
-                parseMode: 'Markdown',
-                thread: processedMessage.thread,
-              });
-              if (!sentId) {
-                logger.debug({ platform: processedMessage.platform }, 'Streaming send returned no messageId');
-                return;
-              }
-              streamedMessageId = sentId;
-              streamedResponseSent = true;
-            } else if (editMessage) {
-              await editMessage({
-                platform: processedMessage.platform,
-                chatId: processedMessage.chatId,
-                messageId: streamedMessageId,
-                text: pendingText,
-                parseMode: 'Markdown',
-                thread: processedMessage.thread,
-              });
-            }
-            lastSentText = pendingText;
-            lastUpdateAt = Date.now();
-          } catch (error) {
-            logger.debug({ error }, 'Streaming response update failed');
-          }
-        };
-
-        const message = await withRetry(
-          async () => {
-            streamHasOutput = false;
-            pendingText = '';
-            lastSentText = '';
-            lastUpdateAt = 0;
-            if (updateTimer) {
-              clearTimeout(updateTimer);
-              updateTimer = null;
-            }
-
-            const stream = client.messages.stream(params);
-            stream.on('text', (_delta, fullText) => {
-              streamHasOutput = true;
-              pendingText = fullText;
-              scheduleFlush();
-            });
-
-            const finalMessage = await stream.finalMessage();
-            if (updateTimer) {
-              clearTimeout(updateTimer);
-              updateTimer = null;
-            }
-            await flushUpdate(true);
-            return finalMessage;
-          },
-          {
-            ...RETRY_POLICIES.default.config,
-            shouldRetry: (error) => !streamHasOutput && isRetryableError(error),
-            onRetry: (info) => {
-              logger.warn({
-                userId: session.userId,
-                attempt: info.attempt,
-                maxAttempts: info.maxAttempts,
-                delay: info.delay,
-                error: info.error.message,
-              }, 'Retrying streaming LLM request');
-            },
-          }
-        );
-
-        if (!streamedResponseSent) {
-          const finalText = extractResponseText(message);
-          if (finalText) {
-            await sendMessage({
-              platform: processedMessage.platform,
-              chatId: processedMessage.chatId,
-              text: finalText,
-              parseMode: 'Markdown',
-              thread: processedMessage.thread,
-            });
-            streamedResponseSent = true;
-          }
+        params: {
+          model: string;
+          max_tokens: number;
+          system: any;
+          tools: any[];
+          messages: any[];
+        }
+      ): Promise<{
+        content: Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
+        stop_reason: string;
+        usage: { input_tokens: number; output_tokens: number };
+      }> => {
+        if (!canStreamResponse) {
+          return createMessageWithRetry(params);
         }
 
-        return message;
+        // Use provider manager's stream method instead of Anthropic-specific client.
+        // buildProviderMessages prepends the system prompt as a system-role
+        // message (the Provider abstraction only accepts string content, so
+        // structured content blocks are stringified).
+        const providerName = resolveProviderForModel(params.model);
+        // Never pass foreign model ids (e.g. claude-*) to Gemini/Groq — use a real Gemini id.
+        const modelForProvider =
+          sanitizeModelForProvider(params.model, providerName) ||
+          (providerName === 'gemini'
+            ? (process.env.CLODDS_GEMINI_MODEL || 'gemini-2.5-flash')
+            : providerName === 'groq'
+              ? (process.env.CLODDS_GROQ_MODEL || 'llama-3.3-70b-versatile')
+              : undefined);
+        logger.info(
+          { provider: providerName, model: modelForProvider, requestedModel: params.model },
+          'Streaming via provider'
+        );
+        const stream = client.stream(
+          buildProviderMessages(params),
+          {
+            model: modelForProvider,
+            maxTokens: params.max_tokens,
+            temperature: 0.7,
+            provider: providerName,
+          });
+
+        let fullContent = '';
+        let streamHasOutput = false;
+
+        for await (const chunk of stream) {
+          if (chunk.content) {
+            streamHasOutput = true;
+            fullContent += chunk.content;
+          }
+          if (chunk.done) break;
+        }
+
+        return {
+          content: [{ type: 'text', text: fullContent }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 0, output_tokens: 0 },
+        };
       };
 
       const createMessage = async (
-        params: Anthropic.MessageCreateParamsNonStreaming
-      ): Promise<Anthropic.Message> => {
+        params: {
+          model: string;
+          max_tokens: number;
+          system: any;
+          tools: any[];
+          messages: any[];
+        }
+      ): Promise<{
+        content: Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
+        stop_reason: string;
+        usage: { input_tokens: number; output_tokens: number };
+      }> => {
         if (!canStreamResponse) {
           return createMessageWithRetry(params);
         }
@@ -17770,8 +17955,8 @@ export async function createAgentManager(
       };
 
       // Strip internal metadata before sending to API — Anthropic rejects extra fields
-      const toApiTools = (defs: ToolDefinition[]): Anthropic.Tool[] =>
-        defs.map(({ metadata: _, ...rest }) => rest) as Anthropic.Tool[];
+      const toApiTools = (defs: ToolDefinition[]): any[] =>
+        defs.map(({ metadata: _, ...rest }) => rest);
 
       // Smart tool gating: zero-intent messages ("hi", "thanks") don't need 22 tools.
       // Send only tool_search so Claude can discover tools if the conversation turns trading.
@@ -17787,7 +17972,11 @@ export async function createAgentManager(
         logger.info('Zero-intent message — using minimal tools (tool_search only)');
       }
 
-      let response: Anthropic.Message;
+      let response: {
+        content: Array<{ type: string; text?: string; id?: string; name?: string; input?: any }>;
+        stop_reason: string;
+        usage: { input_tokens: number; output_tokens: number };
+      };
       try {
         const fullTools = getActiveTools();
         const apiTools = toApiTools(
@@ -17818,23 +18007,12 @@ export async function createAgentManager(
       if (response.usage) {
         lastKnownInputTokens = response.usage.input_tokens;
 
-        // Track prompt cache performance
-        const usage = response.usage as any;
-        const cacheCreation = usage.cache_creation_input_tokens ?? 0;
-        const cacheRead = usage.cache_read_input_tokens ?? 0;
-        const cacheHitRate = cacheRead > 0
-          ? (cacheRead / (cacheRead + lastKnownInputTokens)) * 100
-          : 0;
-
         logger.info(
           {
             inputTokens: lastKnownInputTokens,
             max: modelContextWindow,
-            cacheCreation,
-            cacheRead,
-            cacheHitRate: `${cacheHitRate.toFixed(1)}%`,
           },
-          'API token usage (with cache stats)'
+          'API token usage'
         );
       }
 
@@ -17844,9 +18022,9 @@ export async function createAgentManager(
       while (response.stop_reason === 'tool_use' && toolTurnCount < MAX_TOOL_TURNS) {
         toolTurnCount++;
         const assistantContent = response.content;
-        messages.push({ role: 'assistant', content: assistantContent });
+        messages.push({ role: 'assistant', content: assistantContent as any });
 
-        const toolResults: Anthropic.ToolResultBlockParam[] = [];
+        const toolResults: Array<{ type: string; tool_use_id: string; content: string }> = [];
 
         for (const block of assistantContent) {
           if (block.type === 'tool_use') {
@@ -17872,10 +18050,10 @@ export async function createAgentManager(
 
             // Check if hook blocked the tool
             if (toolBeforeResult?.block) {
-              logger.warn({ tool: block.name, reason: toolBeforeResult.blockReason }, 'Tool blocked by hook');
+              logger.warn({ tool: block.name!, reason: toolBeforeResult.blockReason }, 'Tool blocked by hook');
               toolResults.push({
                 type: 'tool_result',
-                tool_use_id: block.id,
+                tool_use_id: block.id!,
                 content: JSON.stringify({ error: `Tool blocked: ${toolBeforeResult.blockReason || 'Unknown reason'}` }),
               });
               continue;
@@ -17956,7 +18134,7 @@ export async function createAgentManager(
               logger.info({ platform, category, query, found: topResults.length }, 'tool_search executed');
             } else {
               result = await executeTool(
-                block.name,
+                block.name!,
                 finalParams,
                 context
               );
@@ -17998,13 +18176,13 @@ export async function createAgentManager(
 
             toolResults.push({
               type: 'tool_result',
-              tool_use_id: block.id,
+              tool_use_id: block.id!,
               content: truncatedResult,
             });
           }
         }
 
-        messages.push({ role: 'user', content: toolResults });
+        messages.push({ role: 'user', content: toolResults as any });
 
         // =========================================================================
         // CONTEXT CHECK - Compact if approaching limit during tool loop

@@ -30,6 +30,21 @@ export interface CommandContext {
   bittensorService?: import('../bittensor/types').BittensorService;
   commands: CommandRegistry;
   send: (message: OutgoingMessage) => Promise<string | null>;
+  /**
+   * Trading subsystem (bots, strategy builder, logger, safety, …).
+   * Wired from gateway; optional so core commands work without trading enabled.
+   */
+  trading?: {
+    builder?: import('../trading/builder').StrategyBuilder;
+    bots?: import('../trading/bots').BotManager;
+    logger?: import('../trading/logger').TradeLogger;
+    safety?: import('../trading/safety').SafetyManager;
+    backtest?: import('../trading/backtest').BacktestEngine;
+    accounts?: unknown;
+    tracking?: unknown;
+    stream?: unknown;
+    [key: string]: unknown;
+  };
 }
 
 export interface CommandDefinition {
@@ -1084,31 +1099,42 @@ export function createDefaultCommands(): CommandDefinition[] {
         let platform: Platform | undefined;
         let queryParts = parts;
 
-        if (parts.length > 1 && isPlatformName(parts[0].toLowerCase())) {
+        // "/markets polymarket" → platform only (not search text "polymarket")
+        // "/markets polymarket trump" → platform + query
+        if (parts.length >= 1 && isPlatformName(parts[0].toLowerCase())) {
           platform = parts[0].toLowerCase() as Platform;
           queryParts = parts.slice(1);
         }
 
-        const query = queryParts.join(' ');
-        if (!query) {
-          return 'Please provide a search query.';
+        const query = queryParts.join(' ').trim();
+        // Empty query on a platform: broad default so we still hit the live API
+        const searchQuery = query || (platform === 'polymarket' ? 'election' : query);
+        if (!searchQuery) {
+          return 'Please provide a search query.\nExample: /markets polymarket bitcoin';
         }
 
-        const markets = await ctx.feeds.searchMarkets(query, platform);
+        const markets = await ctx.feeds.searchMarkets(searchQuery, platform);
         if (markets.length === 0) {
-          return `No markets found for "${query}"${platform ? ` on ${platform}` : ''}.`;
+          return `No markets found for "${query || searchQuery}"${platform ? ` on ${platform}` : ''}.`;
         }
 
-        const top = markets.slice(0, 6);
-        const lines = [`Markets${platform ? ` - ${platform}` : ''}`];
+        const top = markets.slice(0, 8);
+        const lines = [`Markets${platform ? ` - ${platform}` : ''}${query ? ` · "${query}"` : ''}`];
 
         for (const market of top) {
-          const bestOutcome =
-            market.outcomes.slice().sort((a, b) => b.volume24h - a.volume24h)[0] ||
+          const yes =
+            market.outcomes.find((o) => o.name?.toLowerCase() === 'yes') ||
             market.outcomes[0];
-          const price = bestOutcome ? formatPriceCents(bestOutcome.price) : 'n/a';
+          const price = yes ? formatPriceCents(yes.price) : 'n/a';
+          const vol = Math.round(market.volume24h || 0).toLocaleString();
           lines.push(`- ${market.question}`);
-          lines.push(`  ${market.platform} - ${price} - vol ${Math.round(market.volume24h).toLocaleString()}`);
+          lines.push(`  ${market.platform} | YES ${price} | vol24h $${vol}`);
+          if (market.url || market.slug) {
+            lines.push(`  ${market.url || `slug: ${market.slug}`}`);
+          }
+          if (market.id) {
+            lines.push(`  id: ${market.id}`);
+          }
         }
 
         if (markets.length > top.length) {

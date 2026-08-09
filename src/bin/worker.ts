@@ -32,7 +32,9 @@
 import 'dotenv/config';
 import { createExecutionWorker } from '../queue/jobs';
 import { createExecutionService, type ExecutionConfig } from '../execution';
+import { createPaperExecutionService, isPaperMode } from '../execution/paper-execution-service';
 import { loadConfig } from '../utils/config';
+import { createDatabase, initDatabase } from '../db';
 import { logger } from '../utils/logger';
 import type { RedisOptions } from 'ioredis';
 
@@ -41,6 +43,10 @@ async function main(): Promise<void> {
 
   // Load config (reads ~/.clodds/clodds.json + env vars)
   const config = await loadConfig();
+
+  // Initialize database (needed for paper trading)
+  const db = createDatabase();
+  await initDatabase();
 
   // Build Redis connection — config.queue.redis takes priority, env vars as fallback
   const redis: RedisOptions = {
@@ -105,9 +111,20 @@ async function main(): Promise<void> {
     execConfig.dryRun = config.trading.dryRun ?? false;
   }
 
-  const executionService = createExecutionService(execConfig);
+  let executionService = createExecutionService(execConfig);
   const concurrency = config.queue?.concurrency
     ?? (parseInt(process.env.WORKER_CONCURRENCY ?? '10', 10) || 10);
+
+  // Paper trading mode: wrap execution service with virtual trading simulator
+  if (isPaperMode()) {
+    if (!executionService) {
+      logger.warn('Paper trading mode enabled but no real execution service configured — creating paper-only execution service');
+      executionService = createPaperExecutionService(db);
+    } else {
+      logger.info('Paper trading mode ACTIVE — all orders are virtual, no real trades executed');
+      executionService = createPaperExecutionService(db);
+    }
+  }
 
   logger.info({
     redis: { host: redis.host, port: redis.port },
@@ -117,6 +134,7 @@ async function main(): Promise<void> {
     kalshi: !!execConfig.kalshi,
     opinion: !!execConfig.opinion,
     predictfun: !!execConfig.predictfun,
+    paperMode: isPaperMode(),
   }, 'Worker configuration');
 
   const worker = createExecutionWorker({

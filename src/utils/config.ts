@@ -383,8 +383,13 @@ function deepMerge<T>(target: T, source: Partial<T>): T {
 export async function loadConfig(customPath?: string): Promise<Config> {
   let fileConfig: Partial<Config> = {};
 
-  // Try to load config file
-  const configPath = customPath || CONFIG_FILE;
+  // Try to load config file.
+  // NOTE: Resolve the path dynamically so that runtime changes to
+  // process.env.CLODDS_CONFIG_PATH are honoured. The module-level
+  // CONFIG_FILE constant is captured at import time and would otherwise
+  // ignore env updates made after the module is first loaded (e.g. in tests
+  // or when a process re-reads its env after a config reload).
+  const configPath = customPath || resolveConfigPath();
   if (existsSync(configPath)) {
     try {
       const content = readFileSync(configPath, 'utf-8');
@@ -463,6 +468,21 @@ export async function loadConfig(customPath?: string): Promise<Config> {
       }
     } catch (error) {
       logger.warn({ error }, 'Failed to parse CLODDS_GROUP_POLICIES');
+    }
+  }
+
+  // Apply paper trading mode - forces dryRun=true across all trading modules
+  const paperTradingModeValue = process.env.PAPER_TRADING_MODE;
+  const paperTradingMode = paperTradingModeValue === '1' ||
+    (paperTradingModeValue !== null && paperTradingModeValue !== undefined &&
+     ['true', 'TRUE', 'True', 'yes', 'YES'].includes(paperTradingModeValue.toLowerCase()));
+  if (paperTradingMode) {
+    if (config.trading) config.trading.dryRun = true;
+    if (config.arbitrageExecution) config.arbitrageExecution.dryRun = true;
+    if (config.copyTrading) config.copyTrading.dryRun = true;
+    // Also ensure Percolator dryRun if applicable
+    if (config.feeds && (config.feeds as any).percolator) {
+      (config.feeds as any).percolator.dryRun = true;
     }
   }
 

@@ -3658,3 +3658,4 @@ export * from './twap';
 export * from './bracket-orders';
 export * from './trigger-orders';
 export * from './order-persistence';
+export * from './paper-execution-service';

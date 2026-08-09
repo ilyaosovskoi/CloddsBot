@@ -45,6 +45,7 @@ import { createWhaleTracker, type WhaleTracker } from '../feeds/polymarket/whale
 import { createCopyTradingService, type CopyTradingService } from '../trading/copy-trading';
 import { createSmartRouter, type SmartRouter } from '../execution/smart-router';
 import { createExecutionService, type ExecutionService } from '../execution';
+import { createPaperExecutionService, isPaperMode } from '../execution/paper-execution-service';
 import { createRealtimeAlertsService, connectWhaleTracker, connectOpportunityFinder, type RealtimeAlertsService } from '../alerts';
 import { createOpportunityExecutor, type OpportunityExecutor } from '../opportunity/executor';
 import { createTickRecorder, type TickRecorder } from '../services/tick-recorder';
@@ -683,6 +684,28 @@ export async function createGateway(config: Config): Promise<AppGateway> {
     executionService = orchestrator.execution;
 
     logger.info('Trading orchestrator wired: safety manager + circuit breaker active');
+  }
+
+  // Paper trading mode: wrap execution service with virtual trading simulator
+  // This must come after orchestrator so safety/circuit-breaker still apply
+  // to the real service, but the paper service wraps the final guarded service.
+  if (isPaperMode()) {
+    if (!executionService) {
+      // If trading isn't enabled with real credentials, create a standalone
+      // paper service backed by DB (no real execution possible).
+      logger.warn('Paper trading mode enabled but no real execution service configured — creating paper-only execution service');
+      executionService = createPaperExecutionService(db);
+    } else {
+      // Wrap the guarded execution service: order calls go to paper simulator,
+      // but we keep the real service around for non-order methods (ws, heartbeat, etc.)
+      // by delegating them through the paper service.
+      const realExecution = executionService;
+      executionService = createPaperExecutionService(db);
+      // Note: The paper service implements all methods; non-order methods are no-ops.
+      // If we wanted real WS/heartbeat while paper-trading orders, we'd need a
+      // composite wrapper. For now, paper mode is fully simulated.
+      logger.info('Paper trading mode ACTIVE — all orders are virtual, no real trades executed');
+    }
   }
 
   // Position manager + bridge: automated TP/SL/trailing stop exits.
@@ -1834,6 +1857,9 @@ export async function createGateway(config: Config): Promise<AppGateway> {
     }
     const session = await sessions.getOrCreateSession(normalized);
 
+    // Pass trading subsystem into slash commands (/strategy, /bot, /backtest, …).
+    // strategyBuilder / botManager / tradeLogger are `let` refs assigned during
+    // gateway init; by the time a user sends a command they are populated.
     const commandResponse = await commands.handle(normalized, {
       session,
       sessions,
@@ -1843,6 +1869,12 @@ export async function createGateway(config: Config): Promise<AppGateway> {
       opportunityFinder: opportunityFinder ?? undefined,
       bittensorService: bittensorService ?? undefined,
       send: sendMessage,
+      trading: {
+        builder: strategyBuilder ?? undefined,
+        bots: botManager ?? undefined,
+        logger: tradeLogger ?? undefined,
+        safety: typeof safetyManager !== 'undefined' ? safetyManager ?? undefined : undefined,
+      },
     });
 
     if (commandResponse) {

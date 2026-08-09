@@ -114,11 +114,27 @@ function validateStartupRequirements(): void {
   const errors: string[] = [];
   const warnings: string[] = [];
 
-  // Check for Anthropic API key (required for AI functionality)
-  if (!process.env.ANTHROPIC_API_KEY) {
+  // Check for ANY AI provider API key (required for AI functionality)
+  const hasAiProvider =
+    process.env.ANTHROPIC_API_KEY ||
+    process.env.OPENAI_API_KEY ||
+    process.env.GEMINI_API_KEY ||
+    process.env.GROQ_API_KEY ||
+    process.env.TOGETHER_API_KEY ||
+    process.env.FIREWORKS_API_KEY ||
+    process.env.OLLAMA_URL; // Local Ollama doesn't need API key
+
+  if (!hasAiProvider) {
     errors.push(
-      'ANTHROPIC_API_KEY is not set. The AI agent will not function.\n' +
-      '  Fix: Add ANTHROPIC_API_KEY=sk-ant-... to your .env file\n' +
+      'No AI provider configured. The AI agent will not function.\n' +
+      '  Fix: Add ONE of the following to your .env file:\n' +
+      '  ANTHROPIC_API_KEY=sk-ant-... (Anthropic Claude)\n' +
+      '  OPENAI_API_KEY=sk-... (OpenAI GPT)\n' +
+      '  GEMINI_API_KEY=... (Google Gemini)\n' +
+      '  GROQ_API_KEY=... (Groq)\n' +
+      '  TOGETHER_API_KEY=... (Together AI)\n' +
+      '  FIREWORKS_API_KEY=... (Fireworks AI)\n' +
+      '  OLLAMA_URL=http://localhost:11434 (Local Ollama)\n' +
       '  Or run: clodds onboard'
     );
   }

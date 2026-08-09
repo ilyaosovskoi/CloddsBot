@@ -445,22 +445,55 @@ export async function createPolymarketFeed(): Promise<PolymarketFeed> {
   }
 
   // Search markets
+  /**
+   * Gamma `/markets?_q=` ignores the query and returns arbitrary active markets.
+   * Use `/public-search` which returns matching events + nested markets.
+   */
   async function searchMarketsREST(query: string): Promise<Market[]> {
-    try {
-      const res = await fetch(
-        `${GAMMA_URL}/markets?_limit=20&active=true&closed=false&_q=${encodeURIComponent(query)}`,
-        { signal: AbortSignal.timeout(15000) }
-      );
-      if (!res.ok) return [];
+    const q = query.trim();
+    if (!q) return [];
 
-      const data = (await res.json()) as PolymarketMarket[];
-      return data.map(convertMarket);
+    try {
+      const url =
+        `${GAMMA_URL}/public-search?q=${encodeURIComponent(q)}` +
+        `&limit_per_type=15&events_status=active`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      if (!res.ok) {
+        logger.warn({ status: res.status, query: q }, 'Polymarket public-search failed');
+        return [];
+      }
+
+      const data = (await res.json()) as {
+        events?: Array<{
+          slug?: string;
+          title?: string;
+          closed?: boolean;
+          markets?: Array<Record<string, unknown>>;
+        }>;
+      };
+
+      const results: Market[] = [];
+      const seen = new Set<string>();
+
+      for (const event of data.events ?? []) {
+        if (event.closed) continue;
+        for (const raw of event.markets ?? []) {
+          const market = convertGammaMarket(raw, event.slug);
+          if (!market) continue;
+          if (seen.has(market.id)) continue;
+          seen.add(market.id);
+          results.push(market);
+        }
+      }
+
+      return results.sort((a, b) => (b.volume24h || 0) - (a.volume24h || 0));
     } catch (err) {
-      logger.error({ err, query }, 'Failed to search markets');
+      logger.error({ err, query: q }, 'Failed to search markets');
       return [];
     }
   }
 
+  /** Convert CLOB-style market (legacy shape with tokens[]). */
   function convertMarket(data: PolymarketMarket): Market {
     return {
       id: data.condition_id,
@@ -481,6 +514,75 @@ export async function createPolymarketFeed(): Promise<PolymarketFeed> {
       resolved: data.closed,
       tags: [],
       url: `https://polymarket.com/event/${data.slug}`,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
+  /** Convert Gamma API market object (public-search /markets response). */
+  function convertGammaMarket(
+    raw: Record<string, unknown>,
+    eventSlug?: string
+  ): Market | null {
+    if (raw.closed === true || raw.active === false) return null;
+
+    const conditionId = String(raw.conditionId || raw.condition_id || '');
+    const slug = String(raw.slug || eventSlug || '');
+    const question = String(raw.question || '');
+    if (!conditionId || !question) return null;
+
+    // outcomes / prices may be JSON strings or arrays
+    let outcomeNames: string[] = [];
+    let outcomePrices: number[] = [];
+    let clobTokenIds: string[] = [];
+
+    try {
+      const o = raw.outcomes;
+      outcomeNames = typeof o === 'string' ? JSON.parse(o) : Array.isArray(o) ? (o as string[]) : [];
+    } catch { /* ignore */ }
+    try {
+      const p = raw.outcomePrices;
+      const arr = typeof p === 'string' ? JSON.parse(p) : Array.isArray(p) ? p : [];
+      outcomePrices = (arr as unknown[]).map((x) => parseFloat(String(x)) || 0);
+    } catch { /* ignore */ }
+    try {
+      const c = raw.clobTokenIds;
+      clobTokenIds = typeof c === 'string' ? JSON.parse(c) : Array.isArray(c) ? (c as string[]) : [];
+    } catch { /* ignore */ }
+
+    if (outcomeNames.length === 0) outcomeNames = ['Yes', 'No'];
+
+    const outcomes = outcomeNames.map((name, i) => ({
+      id: clobTokenIds[i] || `${conditionId}:${i}`,
+      tokenId: clobTokenIds[i],
+      name,
+      price: outcomePrices[i] ?? 0.5,
+      volume24h: 0,
+    }));
+
+    const volume24h =
+      parseFloat(String(raw.volume24hr ?? raw.volume_24hr ?? 0)) || 0;
+    const volume =
+      parseFloat(String(raw.volumeNum ?? raw.volume ?? 0)) || 0;
+    const liquidity =
+      parseFloat(String(raw.liquidityNum ?? raw.liquidity ?? 0)) || 0;
+
+    const endRaw = raw.endDate || raw.end_date_iso;
+    const urlSlug = eventSlug || slug;
+
+    return {
+      id: conditionId,
+      platform: 'polymarket' as Platform,
+      slug,
+      question,
+      description: String(raw.description || ''),
+      outcomes,
+      volume24h: volume24h || volume,
+      liquidity,
+      endDate: endRaw ? new Date(String(endRaw)) : undefined,
+      resolved: Boolean(raw.closed),
+      tags: [],
+      url: urlSlug ? `https://polymarket.com/event/${urlSlug}` : undefined,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
